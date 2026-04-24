@@ -180,6 +180,9 @@ curl -s -X POST "$AGENT_ENDPOINT" \
 
 ### `agent/agent.py`
 
+> The full agent code including **optional memory (commented out)** is in the [Memory (Optional)](#memory-optional) section below.
+> Use that version — it is the same agent with memory lines ready to uncomment when needed.
+
 ```python
 import logging
 import os
@@ -196,7 +199,7 @@ MCP_URL = os.environ.get("MCP_URL", "http://localhost:8000/mcp")
 @app.entrypoint
 def handle(payload: dict, context) -> dict:
     # Extract inbound Okta token from request headers
-    headers = context.get("httpHeaders", {}) or context.get("headers", {})
+    headers    = context.get("httpHeaders", {}) or context.get("headers", {})
     normalised = {k.lower(): v for k, v in headers.items()}
     auth_header = normalised.get("authorization", "")
     token = auth_header.removeprefix("Bearer ").removeprefix("bearer ").strip()
@@ -206,7 +209,6 @@ def handle(payload: dict, context) -> dict:
 
     log.info("Token received, forwarding to MCP")
 
-    # Forward same token to MCP
     mcp_client = MCPClient(
         url=MCP_URL,
         headers={"Authorization": f"Bearer {token}"},
@@ -419,6 +421,148 @@ INFO  sub=svc-emp-sync   | tool=update_department   | employee_id=E003 new_dept=
 ```
 
 `sub` is `alice@corp.com` for a human user, `svc-emp-sync` (or similar) for a machine client.
+
+---
+
+## Memory (Optional)
+
+> **Memory is NOT required.** By default the agent is stateless — each REST call starts fresh with zero history.
+> Add memory only if your use case needs it. Three options are available depending on how much persistence you want.
+
+| Type | What it does | When to use it |
+|---|---|---|
+| **None (default)** | Each call is independent | Batch jobs, single Q&A, M2M services |
+| **Short-term (session)** | Remembers conversation turns across REST calls for a session | HR user chatting back and forth |
+| **Long-term (vector store)** | Remembers facts permanently across sessions | Preferences, past decisions, org history |
+
+### agent.py — with optional short-term session memory (DynamoDB)
+
+The block below shows the full agent with memory **commented out**.
+Uncomment the marked sections to enable it.
+
+```python
+import logging
+import os
+# OPTIONAL MEMORY: uncomment the next two lines if using session memory
+# import json
+# import boto3
+
+from bedrock_agentcore import BedrockAgentCoreApp
+from strands import Agent
+from strands.tools.mcp import MCPClient
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)-5s %(message)s")
+log = logging.getLogger(__name__)
+
+app = BedrockAgentCoreApp()
+MCP_URL = os.environ.get("MCP_URL", "http://localhost:8000/mcp")
+
+# ---------------------------------------------------------------------------
+# OPTIONAL MEMORY: Short-term session memory via DynamoDB
+# Uncomment this entire block to enable multi-turn conversation memory.
+# Also add SESSION_TABLE env var in deploy.py and create the DynamoDB table.
+#
+# TABLE  = os.environ.get("SESSION_TABLE", "emp-agent-sessions")
+# dynamo = boto3.resource("dynamodb").Table(TABLE)
+#
+# def load_history(session_id: str) -> list:
+#     try:
+#         item = dynamo.get_item(Key={"session_id": session_id}).get("Item", {})
+#         return json.loads(item.get("history", "[]"))
+#     except Exception:
+#         return []
+#
+# def save_history(session_id: str, history: list):
+#     dynamo.put_item(Item={
+#         "session_id": session_id,
+#         "history":    json.dumps(history),
+#     })
+# ---------------------------------------------------------------------------
+
+@app.entrypoint
+def handle(payload: dict, context) -> dict:
+    # Extract inbound Okta token from request headers
+    headers    = context.get("httpHeaders", {}) or context.get("headers", {})
+    normalised = {k.lower(): v for k, v in headers.items()}
+    auth_header = normalised.get("authorization", "")
+    token = auth_header.removeprefix("Bearer ").removeprefix("bearer ").strip()
+
+    if not token:
+        return {"error": "No authorization token found in request"}
+
+    log.info("Token received, forwarding to MCP")
+
+    # OPTIONAL MEMORY: get session_id from payload if using memory
+    # session_id = payload.get("session_id", "default")
+    # history    = load_history(session_id)
+
+    mcp_client = MCPClient(
+        url=MCP_URL,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    with mcp_client:
+        agent = Agent(
+            system_prompt=(
+                "You are an Employee Management assistant. "
+                "Help users look up employees, list teams, and update departments. "
+                "Be concise and factual."
+            ),
+            tools=mcp_client.tools(),
+            # OPTIONAL MEMORY: pass history so agent remembers previous turns
+            # messages=history,
+        )
+        response = agent(payload.get("prompt", ""))
+
+        # OPTIONAL MEMORY: save updated history back to DynamoDB
+        # save_history(session_id, agent.messages)
+
+    return {"response": str(response)}
+
+if __name__ == "__main__":
+    app.run()
+```
+
+### If you enable short-term memory — create the DynamoDB table
+
+```bash
+aws dynamodb create-table \
+  --table-name emp-agent-sessions \
+  --attribute-definitions AttributeName=session_id,AttributeType=S \
+  --key-schema AttributeName=session_id,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region us-east-1
+```
+
+Also add to your IAM role:
+- `AmazonDynamoDBFullAccess` (or a scoped policy on the table)
+
+And add to `deploy.py` environment variables:
+```python
+environmentVariables={
+    "MCP_URL":       MCP_URL,
+    "SESSION_TABLE": "emp-agent-sessions",   # add this line
+},
+```
+
+### If you enable memory — caller passes session_id
+
+```bash
+# Turn 1
+curl -X POST "$ENDPOINT/invocations" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "alice-session-1", "prompt": "Who is in Engineering?"}'
+
+# Turn 2 — agent remembers turn 1
+curl -X POST "$ENDPOINT/invocations" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "alice-session-1", "prompt": "Move the first one to Finance"}'
+```
+
+> **Note:** Machine token (M2M) agents almost never need memory — they ask one question and move on.
+> Session memory is most useful for human HR users having a back-and-forth conversation.
 
 ---
 
